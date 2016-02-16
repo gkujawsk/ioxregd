@@ -1,0 +1,2 @@
+{ "method": "REGISTER", "secret": "S#cr#t", "name": "c819-01", "region":"obrzezna,waw,pl", "c": { "temperature": "true", "humidity": "true", "voltage": "true", "rpm": "true" } }
+ s_client -connect localhost:65535
