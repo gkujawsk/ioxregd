@@ -36,10 +36,6 @@ RPM_HIGH_TRESHOLD = 120
 RPM_LOW_TRESHOLD = 20
 POLLING_INTERVAL = 5
 
-
-
-
-
 class EchoHandler(asyncore.dispatcher_with_send):
     def __init__(self, c, conn_sock, client_addr, server):
         self.server = server
@@ -267,6 +263,15 @@ class EchoHandler(asyncore.dispatcher_with_send):
 
     def operation_query(self,pdu):
         log.debug("operation_query called")
+        if "name" in pdu:
+            packet = {"method":"QUERY"}
+            jasoned_pdu = json.dumps(packet)+"\n"
+            self.server.registered_clients[pdu["name"].send(jasoned_pdu)]
+            log.debug("operation_query: query send to %s" % (pdu["name"]))
+            self.status_200()
+        else:
+            log.debug("operation_query: missing name attribute")
+            self.status_500("Missing name attribute")
 
     def client_registered(self,name):
         self.c.execute("SELECT * FROM devices WHERE name = ?",[name])
