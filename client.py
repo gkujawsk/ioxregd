@@ -1,15 +1,22 @@
-import ioxclient
+import getopt
 import signal
 import sys
-import getopt
-from daemonize import Daemonize
+
+from Queue import Queue
+
+import ioxclient
+import modbus
 
 pid = "/tmp/ioxclient.pid"
-interface = "0.0.0.0"
 port = 65535
 secret = 'S#cr#t'
 ioxregd_server = '127.0.0.1'
 client = ""
+m = ""
+q = Queue()
+
+threads = []
+
 foreground = False
 c = {}
 c["voltage"] = False
@@ -22,8 +29,10 @@ def signal_handler(signal, frame):
         sys.exit(0)
 
 def main():
-    client = ioxclient.Ioxclient(interface, port, secret,c)
-    client.client_forever()
+    client = ioxclient.Ioxclient(ioxregd_server, port, secret,c,q)
+    client.loop()
+    m = modbus.Modbus(5,q,ioxclient.log)
+    m.loop()
 
 signal.signal(signal.SIGINT, signal_handler)
 
@@ -48,5 +57,7 @@ for opt, arg in opts:
   elif opt in ("-R", "--rpm"):
      c["rpm"] = True
 
-daemon = Daemonize(app="ioxclient", pid=pid, action=main, chdir="./", logger=ioxclient.log, keep_fds=[ioxclient.fh.stream.fileno()], foreground=foreground)
-daemon.start()
+main()
+
+#daemon = Daemonize(app="ioxclient", pid=pid, action=main, chdir="./", logger=ioxclient.log, keep_fds=[ioxclient.fh.stream.fileno()], foreground=foreground)
+#daemon.start()
