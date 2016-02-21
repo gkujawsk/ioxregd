@@ -1,11 +1,11 @@
-import logging
 import asyncore
-import socket
-import sqlite3
 import datetime
 import json
-import ssl
+import logging
 import select
+import socket
+import sqlite3
+import ssl
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
@@ -38,11 +38,13 @@ POLLING_INTERVAL = 5
 
 class EchoHandler(asyncore.dispatcher_with_send):
     def __init__(self, c, conn_sock, client_addr, server):
+        self.currentRid = ""
         self.server = server
         self.c = c
 #        self.conn_sock = conn_sock
         self.conn_sock = ssl.wrap_socket(conn_sock, keyfile='ioxregd.key', certfile='ioxregd.crt',server_side=True, \
                                          do_handshake_on_connect=False)
+        self.rids = {}
         while True:
             try:
                 self.conn_sock.do_handshake()
@@ -81,8 +83,12 @@ class EchoHandler(asyncore.dispatcher_with_send):
                 self.method_query(pdu)
             elif(pdu['method'] == "MANAGE"):
                 self.method_manage(pdu)
-            else:
+            elif(pdu['method'] == "REPLY"):
+                self.method_reply(pdu)
+            elif(pdu['method'] == "QUERY"):
                 self.method_query(pdu)
+            else:
+                log.debug("handle_read(): invalid method")
         except ValueError:
             log.debug("Decoding JSON failed.")
 
@@ -93,15 +99,21 @@ class EchoHandler(asyncore.dispatcher_with_send):
         self.close()
         #pass
 
+    def method_reply(self,pdu):
+        log.debug("method_reply() called")
+        if "rid" in pdu:
+            rid = pdu["rid"]
+            jasoned_pdu = json.dumps(pdu) + "\n"
+            self.server.registered_rids[rid].send(jasoned_pdu)
+
     def method_register(self,pdu):
         log.debug("method_register: called")
+        self.currentRid = pdu['rid']
         self.name = pdu['name']
-        log.debug("line 113")
         try:
             self.c.execute("SELECT * FROM devices WHERE ip = ? AND port = ?",(self.client_addr[0],self.client_addr[1]))
         except sqlite3.Error as e:
             log.debug("method_register: %s" % e.args[0])
-        log.debug("line 115")
         if(self.c.fetchone()):
             log.info("method_register: only one registration allowed for ip:port combination")
             self.status_500("Only one registration allowed")
@@ -153,6 +165,9 @@ class EchoHandler(asyncore.dispatcher_with_send):
             if (pdu['password'] == password and pdu['username'] == username):
                 log.info("method_manage: successfuly authenticated")
                 if('operation' in pdu):
+                    rid = pdu["rid"]
+                    self.server.registered_rids[rid] = self
+
                     if(pdu['operation'] == "list"):
                         self.operation_list(pdu)
                     elif(pdu['operation'] == "set_treshold"):
@@ -225,7 +240,7 @@ class EchoHandler(asyncore.dispatcher_with_send):
 
     def operation_set_threshold(self,pdu):
         log.debug("operation_set_threshold: called")
-        allowed_attribs = ["temp","humidity","voltage","rpm"]
+        allowed_attribs = ["temp","humidity","voltage","rpm","interval"]
         allowed_tresholds = ["low", "high"]
         stm = "UPDATE devices SET "
         set_stm = ""
@@ -240,8 +255,9 @@ class EchoHandler(asyncore.dispatcher_with_send):
                         set_stm += " " + attrib + "_" + treshold + "_treshold = ?, "
                         bind_values.append(pdu['params'][attrib][treshold])
                     else:
-                        log.debug("operation_set: treshold unknown")
-                        self.status_500("Attribute treshold unknown")
+                        set_stm += " interval = ?, "
+                        bind_values.append(pdu['params'][attrib])
+
             else:
                 log.debug("operation_set: attribute unknown")
                 self.status_500("Attribute unknown")
@@ -259,7 +275,7 @@ class EchoHandler(asyncore.dispatcher_with_send):
         del pdu['name']
         jasoned_pdu = json.dumps(pdu)+"\n"
         self.server.registered_clients[name].send(jasoned_pdu)
-        self.status_200()
+        #self.status_200()
 
     def operation_query(self,pdu):
         log.debug("operation_query called")
@@ -279,10 +295,10 @@ class EchoHandler(asyncore.dispatcher_with_send):
             return True
 
     def status_200(self, desc="OK"):
-        self.send('{"status": "200", "desc": "' + desc + '"}\n')
+        self.send('{"method":"REPLY", "status": "200", "desc": "' + desc + '","rid":"'+self.currentRid+'"}\n')
 
     def status_500(self, desc="ERROR"):
-        self.send('{"status": "500", "desc": "' + desc + '"}\n')
+        self.send('{"method":"REPLY", "status": "500", "desc": "' + desc + '","rid":"'+self.currentRid+'"}\n')
 
 class Ioxregd(asyncore.dispatcher):
 
@@ -297,6 +313,7 @@ class Ioxregd(asyncore.dispatcher):
         log.debug("bind: address=%s:%s" % (host, port))
         self.listen(5)
         self.registered_clients = {}
+        self.registered_rids = {}
         self.remote_clients = []
         self.conn = ""
         self.c = ""
@@ -325,7 +342,7 @@ class Ioxregd(asyncore.dispatcher):
                 humidity_high_treshold default '%s', humidity_low_treshold default '%s', \
                 voltage_high_treshold default '%s', voltage_low_treshold default '%s', \
                 rpm_high_treshold default '%s', rpm_low_treshold default '%s', \
-                alert default 'none', polling_interval default  %s\
+                alert default 'none', interval default  %s\
                 )" % (TEMP_HIGH_TRESHOLD, TEMP_LOW_TRESHOLD, \
                       HUMIDITY_HIGH_TRESHOLD, HUMIDITY_LOW_TRESHOLD,\
                       VOLTAGE_HIGH_TRESHOLD, VOLTAGE_LOW_TRESHOLD,\
