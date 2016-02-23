@@ -3,6 +3,7 @@ import signal
 import sys
 
 from Queue import Queue
+from daemonize import Daemonize
 
 import ioxclient
 import modbus
@@ -30,9 +31,13 @@ def signal_handler(signal, frame):
 
 def main():
     client = ioxclient.Ioxclient(ioxregd_server, port, secret,c,q)
+    client.daemon = True
     client.loop()
     m = modbus.Modbus(5,q,ioxclient.log)
+    m.daemon = True
     m.loop()
+    client.join()
+    m.join()
 
 signal.signal(signal.SIGINT, signal_handler)
 

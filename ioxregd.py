@@ -55,7 +55,10 @@ class EchoHandler(asyncore.dispatcher_with_send):
                 elif err.args[0] == ssl.SSLWantWriteError:
                     select.select([],[self.conn_sock],[])
                 else:
-                    raise
+                    log.info("Failed SSL handshake ")
+                    self.conn_sock.close()
+                    return None
+
         self.client_addr = client_addr
         self.out_buffer = ""
         self.is_writable = False
@@ -97,7 +100,6 @@ class EchoHandler(asyncore.dispatcher_with_send):
         log.info("conn_closed: client_address=%s:%s" % (self.client_addr[0], self.client_addr[1]))
         self.c.execute("DELETE FROM devices WHERE ip = ? AND port = ?",(self.client_addr[0],self.client_addr[1]))
         self.close()
-        #pass
 
     def method_reply(self,pdu):
         log.debug("method_reply() called")
