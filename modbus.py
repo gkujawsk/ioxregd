@@ -1,11 +1,9 @@
 import threading
 import time
 
-#logging.basicConfig(level=logging.DEBUG,
-#                    format='[%(levelname)s] (%(threadName)-10s) %(message)s',
-#                    )
+
 class Modbus(threading.Thread):
-    def __init__(self,i,q,log):
+    def __init__(self,i,q,log,slaves):
         threading.Thread.__init__(self)
         self.log = log
         self.q = q
@@ -16,15 +14,30 @@ class Modbus(threading.Thread):
                    "interval":i
                    }
         self.a = None
+        self.current = None
+        self.slaves = {}
+        for address in slaves:
+            self.slaves[address] = eval("modbusdevices.Modbus"+slaves[address]+"(address="+address+")")
 
     def run(self):
         self.log.debug('Starting with interval %s' % (self.c["interval"]))
         while True:
             time.sleep(int(self.c["interval"]))
             self.log.debug("Current interval is %s" % self.c["interval"])
+            lock = threading.Lock()
+            lock.acquire()
+            m = {}
+            for s in self.slaves:
+                if self.slaves[s].readable:
+                    try:
+                        m.update(self.slaves[s].read(self.slaves[s].input_regs.keys()))
+                    except IOError:
+                        self.log.debug("Modbus:run(): Failed to read from instrument")
+            self.current = m
+            lock.release()
             while True:
                 try:
-                    pdu = self.q.get(False)
+                    pdu = self.q["one"].get(False)
                     if pdu is None:
                         break
                     else:
@@ -42,6 +55,21 @@ class Modbus(threading.Thread):
 
     def loop(self):
         self.start()
+
+    def get_slaves(self):
+        r = {}
+        for s in self.slaves:
+            r[s] = {"desc": self.slaves[s].desc, "name": self.slaves[s].name}
+        return r
+
+    def get_thresholds(self):
+        r = {}
+        for s in self.slaves:
+            r[s] = self.slaves[s].tresholds
+        return r
+
+    def get_alert(self):
+        return self.a
 
     def method_manage(self,pdu):
         self.log.debug("method_manage() called")

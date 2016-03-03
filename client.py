@@ -1,5 +1,4 @@
 import getopt
-import signal
 import sys
 
 from Queue import Queue
@@ -14,35 +13,32 @@ secret = 'S#cr#t'
 ioxregd_server = '127.0.0.1'
 client = ""
 m = ""
-q = Queue()
-
-threads = []
-
+q = {"one":Queue(), "two":Queue()}
+slaves = {}
+name = ""
+region = ""
 foreground = False
-c = {}
-c["voltage"] = False
-c["temperature"] = False
-c["humidity"] = False
-c["rpm"] = False
-
-def signal_handler(signal, frame):
-        ioxregd.log.info("KILLED BY CTRL+C")
-        sys.exit(0)
 
 def main():
-    client = ioxclient.Ioxclient(ioxregd_server, port, secret,c,q)
+    client = ioxclient.Ioxclient(ioxregd_server, port, secret,slaves,q,name,region)
     client.daemon = True
     client.loop()
-    m = modbus.Modbus(5,q,ioxclient.log)
+    m = modbus.Modbus(5,q,ioxclient.log,slaves)
     m.daemon = True
     m.loop()
-    client.join()
-    m.join()
+    client.attach(m)
+    try:
+        while client.is_alive() or m.is_alive():
+            client.join(timeout=1.0)
+            m.join(timeout=1.0)
+    except (KeyboardInterrupt,SystemExit):
+        ioxclient.log.info("KILLED BY CTRL+C")
+        sys.exit(2)
 
-signal.signal(signal.SIGINT, signal_handler)
+#signal.signal(signal.SIGINT, signal_handler)
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:],"hfTHVR",["foreground","help","voltage","temperature","humidity","rpm"])
+    opts, args = getopt.getopt(sys.argv[1:],"hfA:B:C:D:n:r:",["foreground","help","modbus1:","modbus2:","modbus3:","modbus4","name:","region:"])
 except getopt.GetoptError:
     print 'server.py -h'
     sys.exit(2)
@@ -52,16 +48,19 @@ for opt, arg in opts:
      print 'server.py -f -T -H -V -R'
      sys.exit()
   elif opt in ("-f", "--foreground"):
-     foreground = True
-  elif opt in ("-V", "--voltage"):
-     c["voltage"] = True
-  elif opt in ("-H", "--humidity"):
-     c["humidity"] = True
-  elif opt in ("-T", "--temperature"):
-     c["temperature"] = True
-  elif opt in ("-R", "--rpm"):
-     c["rpm"] = True
-
+      foreground = True
+  elif opt in ("-A", "--modbus1"):
+      slaves["1"] = arg
+  elif opt in ("-B", "--modbus2"):
+      slaves["2"] = arg
+  elif opt in ("-C", "--modbus3"):
+      slaves["3"] = arg
+  elif opt in ("-D", "--modbus4"):
+      slaves["4"] = arg
+  elif opt in ("-n", "--name"):
+      name = arg
+  elif opt in ("-r", "--region"):
+      region = arg
 main()
 
 daemon = Daemonize(app="ioxclient", pid=pid, action=main, chdir="./", logger=ioxclient.log, keep_fds=[ioxclient.fh.stream.fileno()], foreground=foreground)

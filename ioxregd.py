@@ -22,6 +22,7 @@ fh.setFormatter(formatter)
 # add the handlers to logger
 log.addHandler(ch)
 log.addHandler(fh)
+#log.setLevel(logging.INFO)
 
 BACKLOG                 = 5
 SIZE                    = 1024
@@ -36,7 +37,9 @@ RPM_HIGH_TRESHOLD = 120
 RPM_LOW_TRESHOLD = 20
 POLLING_INTERVAL = 5
 
-class EchoHandler(asyncore.dispatcher_with_send):
+class EchoHandler(asyncore.dispatcher):
+    established = False
+    want_read = want_write = True
     def __init__(self, c, conn_sock, client_addr, server):
         self.currentRid = ""
         self.server = server
@@ -44,23 +47,30 @@ class EchoHandler(asyncore.dispatcher_with_send):
 #        self.conn_sock = conn_sock
         self.conn_sock = ssl.wrap_socket(conn_sock, keyfile='ioxregd.key', certfile='ioxregd.crt',server_side=True, \
                                          do_handshake_on_connect=False)
+        self.sock = self.conn_sock
         self.rids = {}
         while True:
             try:
                 self.conn_sock.do_handshake()
                 break
+            except ssl.SSLWantReadError:
+                log.debug("_handshake() SSLWantReadError")
+                select.select([self.conn_sock],[],[])
+            except ssl.SSLWantWriteError:
+                log.debug("_handshake() SSLWantWriteError")
+                select.select([],[self.conn_sock],[])
             except ssl.SSLError as err:
-                if err.args[0] == ssl.SSLWantReadError:
-                    select.select([self.conn_sock],[],[])
-                elif err.args[0] == ssl.SSLWantWriteError:
-                    select.select([],[self.conn_sock],[])
-                else:
-                    log.info("Failed SSL handshake ")
-                    self.conn_sock.close()
-                    return None
+                log.info("Failed SSL handshake ")
+                self.conn_sock.close()
+                return None
+            else:
+                self.established = True
+                break;
 
+        self.established = True
         self.client_addr = client_addr
         self.out_buffer = ""
+        self.my_buffer = ""
         self.is_writable = False
         self.name = ""
         asyncore.dispatcher.__init__(self,self.conn_sock)
@@ -70,10 +80,23 @@ class EchoHandler(asyncore.dispatcher_with_send):
         return True
 
     def writable(self):
-        return self.is_writable;
+        if(self.established):
+            if len(self.my_buffer) > 0:
+                log.debug("writable() mam do wyslannia %d B" % (len(self.my_buffer)))
+                return True
+            else:
+                return False
+        else:
+            return False
+
+    def handle_write(self):
+        log.debug("handle_write(): called")
+        sent = self.send(self.my_buffer)
+        log.debug("handle_write(): %d B has been sent" % (sent))
+        self.my_buffer = self.my_buffer[sent:]
 
     def handle_read(self):
-        log.debug("handle_read")
+        log.debug("handle_read() called")
         data = self.recv(8192).strip()
         log.debug('%s from %s' % (data, self.addr))
         try:
@@ -90,13 +113,15 @@ class EchoHandler(asyncore.dispatcher_with_send):
                 self.method_reply(pdu)
             elif(pdu['method'] == "QUERY"):
                 self.method_query(pdu)
+            elif(pdu["method"] == "ALERT"):
+                self.method_alert(pdu)
             else:
-                log.debug("handle_read(): invalid method")
+                log.debug("handle_read(): Invalid method")
         except ValueError:
-            log.debug("Decoding JSON failed.")
+            log.debug("handle_read(): Decoding JSON failed.")
 
     def handle_close(self):
-        log.debug("handle_close")
+        log.debug("handle_close() called")
         log.info("conn_closed: client_address=%s:%s" % (self.client_addr[0], self.client_addr[1]))
         self.c.execute("DELETE FROM devices WHERE ip = ? AND port = ?",(self.client_addr[0],self.client_addr[1]))
         self.close()
@@ -113,17 +138,27 @@ class EchoHandler(asyncore.dispatcher_with_send):
         self.currentRid = pdu['rid']
         self.name = pdu['name']
         try:
-            self.c.execute("SELECT * FROM devices WHERE ip = ? AND port = ?",(self.client_addr[0],self.client_addr[1]))
+            self.c.execute("SELECT * FROM devices WHERE name = ?",[self.name])
         except sqlite3.Error as e:
             log.debug("method_register: %s" % e.args[0])
         if(self.c.fetchone()):
-            log.info("method_register: only one registration allowed for ip:port combination")
+            log.info("method_register: only one registration allowed for each ioxclient")
             self.status_500("Only one registration allowed")
         else:
             if('name' in pdu and 'region' in pdu and 'secret' in pdu):
                 if (pdu['secret'] == self.server.secret):
-                    self.c.execute("INSERT INTO devices (ip, port, name, date, region) VALUES(?,?,?,?,?)", \
-                              (self.client_addr[0],self.client_addr[1],pdu['name'],  datetime.datetime.today(), pdu['region']))
+                    m = []
+                    for address in ("1","2","3","4"):
+                        m.append(pdu["slaves"][address] if address in pdu["slaves"] else "0")
+
+                    self.c.execute("INSERT INTO devices \
+                    (ip, port, name, date, region, m1, m2, m3, m4) \
+                    VALUES(?,?,?,?,?,?,?,?,?)", \
+                    (self.client_addr[0],self.client_addr[1],pdu['name'], \
+                     datetime.datetime.today(), pdu['region'], \
+                     m[0],m[1],m[2],m[3]
+                    ))
+
                     self.server.registered_clients[pdu['name']] = self
                     log.debug("method_register: client registered successfuly")
                     self.status_200()
@@ -134,10 +169,32 @@ class EchoHandler(asyncore.dispatcher_with_send):
                 log.info("method_register: Missing attributes")
                 self.status_500("Missing attributes")
 
+
     def method_deregister(self,pdu):
         log.debug("method_deregister: called")
         self.c.execute("DELETE FROM devices WHERE ip = ? AND port = ?",(self.client_addr[0],self.client_addr[1]))
         self.status_200()
+
+    def method_alert(self,pdu):
+        log.debug("method_alert(): called")
+        if "name" in pdu and "rid" in pdu:
+            self.currentRid = pdu['rid']
+            self.c.execute("SELECT * FROM devices WHERE name = ? ", [pdu["name"]])
+            row = self.c.fetchone()
+            if row:
+                alert = {"name": pdu["name"], "type":pdu["type"], \
+                         "severity": pdu["severity"], "desc":pdu["desc"], \
+                         "src": pdu["src"],"date": pdu["date"]}
+                self.server.alerts.append(alert)
+                log.debug("method_alert(): alert received")
+                log.debug("method_alert(): current alerts count is %d" %(len(self.server.alerts)))
+                self.status_200("OK")
+            else:
+                log.debug("method_alert(): alert received for unregistred ioxclient %s" % (pdu["name"]))
+                self.status_500("Not registred")
+        else:
+            log.debug("method_alert(): missing attributes")
+            self.status_500("Missign attributes")
 
     def method_query(self,pdu):
         log.debug("method_query: called")
@@ -172,12 +229,16 @@ class EchoHandler(asyncore.dispatcher_with_send):
 
                     if(pdu['operation'] == "list"):
                         self.operation_list(pdu)
+                    elif(pdu['operation'] == "alerts"):
+                        self.operation_alerts(pdu)
                     elif(pdu['operation'] == "set_treshold"):
                         self.operation_mux(pdu)
                     elif(pdu['operation'] == "set_alert"):
                         self.operation_mux(pdu)
-                    elif(pdu['operation'] == "query"):
+                    elif(pdu['operation'] == "set"):
                         self.operation_mux(pdu)
+                    elif(pdu['operation'] == "details"):
+                        self.operation_details(pdu)
                     else:
                         log.info("method_manage: Operation invalid")
                         self.status_500("Operation invalid")
@@ -195,6 +256,15 @@ class EchoHandler(asyncore.dispatcher_with_send):
         log.debug("method_unknown: called")
         self.status_500("Not implemended")
 
+    def operation_alerts(self,pdu):
+        log.debug("operation_alert(): called")
+        pdu = {}
+        pdu['status'] = "200"
+        pdu['data'] = self.server.alerts
+        jsoned_pdu = json.dumps(pdu)
+        self.my_buffer = jsoned_pdu + "\n"
+        self.server.alerts = []
+
     def operation_list(self,pdu):
         log.debug("operation_list: called")
         self.c.execute("SELECT * from devices")
@@ -203,10 +273,10 @@ class EchoHandler(asyncore.dispatcher_with_send):
         devices_array = []
         pdu['status'] = "200"
         for row in rows:
-            devices_array.append({"ip":row[0],"port":row[1],"name":row[2],"date":row[3]})
+            devices_array.append({"ip":row[0],"port":row[1],"name":row[2],"region":row[3]})
         pdu['data'] = devices_array
         jasoned_pdu = json.dumps(pdu)
-        self.send(jasoned_pdu +"\n")
+        self.my_buffer = jasoned_pdu + "\n"
 
     def operation_mux(self,pdu):
         log.debug("operation_mux: called")
@@ -216,8 +286,8 @@ class EchoHandler(asyncore.dispatcher_with_send):
                     self.operation_set_threshold(pdu)
                 elif(pdu['operation'] == "set_alert"):
                     self.operation_set_alert(pdu)
-                elif(pdu['operation'] == "query"):
-                    self.operation_query(pdu)
+                elif(pdu['operation'] == "set"):
+                    self.operation_set(pdu)
             else:
                 log.debug("operation_set: device name not registered")
                 self.status_500("device name not registered")
@@ -225,17 +295,24 @@ class EchoHandler(asyncore.dispatcher_with_send):
             log.debug("operation_set: device name missing")
             self.status_500("device name missing")
 
+    def operation_set(self,pdu):
+        log.debug("operation_set(): called")
+        if "alert" in pdu['params']:
+            self.operation_set_alert(pdu)
+        if "tresholds" in pdu['params']:
+            self.operation_set_threshold(pdu)
+        self.operation_set_send(pdu)
+
     def operation_set_alert(self,pdu):
         log.debug("operation_set_alert: called")
         allowed_alert_inputs = ["temp", "humidity", "voltage", "rpm"]
         stm = "UPDATE devices SET alert = ? WHERE name = ?"
         bind_values = []
-        if pdu['params'] in allowed_alert_inputs:
-            bind_values.append(pdu['params'])
+        if pdu['params']['alert'] in allowed_alert_inputs:
+            bind_values.append(pdu['params']['alert'])
             bind_values.append(pdu['name'])
             self.c.execute(stm, bind_values)
-            log.debug("operation_set_alert: alerting for %s tresholds" % pdu['params'])
-            self.operation_set_send(pdu)
+            log.debug("operation_set_alert: alerting for %s tresholds" % pdu['params']['alert'])
         else:
             log.debug("operation_set_alert: %s is unknown alert input" % pdu['params'])
             self.status_500("Unknown alert input")
@@ -248,27 +325,26 @@ class EchoHandler(asyncore.dispatcher_with_send):
         set_stm = ""
         where_stm = "WHERE name = ?"
         bind_values = []
-        for attrib in pdu['params']:
+        for attrib in pdu['params']['tresholds']:
             if(attrib in allowed_attribs):
-                log.debug("operation_set: attribute %s accepted" % attrib)
-                for treshold in pdu['params'][attrib]:
+                log.debug("operation_set_threshold: attribute %s accepted" % attrib)
+                for treshold in pdu['params']['tresholds'][attrib]:
                     if(treshold in allowed_tresholds):
-                        log.debug("operation_set: tresholds %s accepted for %s attribute" % (treshold, attrib))
+                        log.debug("operation_set_threshold: thresholds %s accepted for %s attribute" % (treshold, attrib))
                         set_stm += " " + attrib + "_" + treshold + "_treshold = ?, "
-                        bind_values.append(pdu['params'][attrib][treshold])
+                        bind_values.append(pdu['params']['tresholds'][attrib][treshold])
                     else:
                         set_stm += " interval = ?, "
-                        bind_values.append(pdu['params'][attrib])
+                        bind_values.append(pdu['params']['tresholds'][attrib])
 
             else:
-                log.debug("operation_set: attribute unknown")
+                log.debug("operation_set_thresholds: attribute unknown")
                 self.status_500("Attribute unknown")
 
         set_stm = set_stm[:-2]
         stm += set_stm + " " + where_stm
         bind_values.append(pdu['name'])
         self.c.execute(stm, bind_values)
-        self.operation_set_send(pdu)
 
     def operation_set_send(self,pdu):
         name = pdu['name']
@@ -279,16 +355,16 @@ class EchoHandler(asyncore.dispatcher_with_send):
         self.server.registered_clients[name].send(jasoned_pdu)
         #self.status_200()
 
-    def operation_query(self,pdu):
-        log.debug("operation_query called")
+    def operation_details(self,pdu):
+        log.debug("operation_details(): called")
         if "name" in pdu:
-            packet = {"method":"QUERY"}
+            packet = {"method":"MANAGE","operation":"details","rid":pdu["rid"]}
             jasoned_pdu = json.dumps(packet)+"\n"
-            self.server.registered_clients[pdu["name"].send(jasoned_pdu)]
-            log.debug("operation_query: query send to %s" % (pdu["name"]))
-            self.status_200()
+            self.server.registered_clients[pdu["name"]].send(jasoned_pdu)
+            log.debug("operation_details(): request send to %s" % (pdu["name"]))
+            #self.status_200()
         else:
-            log.debug("operation_query: missing name attribute")
+            log.debug("operation_details(): missing name attribute")
             self.status_500("Missing name attribute")
 
     def client_registered(self,name):
@@ -315,6 +391,7 @@ class Ioxregd(asyncore.dispatcher):
         log.debug("bind: address=%s:%s" % (host, port))
         self.listen(5)
         self.registered_clients = {}
+        self.alerts = []
         self.registered_rids = {}
         self.remote_clients = []
         self.conn = ""
@@ -340,6 +417,7 @@ class Ioxregd(asyncore.dispatcher):
         try:
             self.c.execute("DROP TABLE IF EXISTS devices")
             self.c.execute("CREATE TABLE devices (ip text, port text, name text, region text, date text, \
+                m1 text, m2 text, m3 text, m4 text, \
                 temp_high_treshold default '%s', temp_low_treshold default '%s', \
                 humidity_high_treshold default '%s', humidity_low_treshold default '%s', \
                 voltage_high_treshold default '%s', voltage_low_treshold default '%s', \

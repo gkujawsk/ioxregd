@@ -1,4 +1,5 @@
 import asyncore
+import datetime
 import inspect
 import json
 import logging
@@ -41,7 +42,7 @@ POLLING_INTERVAL = 5
 class Ioxclient(asyncore.dispatcher, threading.Thread):
     want_read = want_write = True
     established = False
-    def __init__(self, host, port, secret,c,q):
+    def __init__(self, host, port, secret,slaves,q, name="",region=""):
         asyncore.dispatcher.__init__(self)
         threading.Thread.__init__(self)
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -49,13 +50,18 @@ class Ioxclient(asyncore.dispatcher, threading.Thread):
         self.connect((host,port))
         self.secret = secret
         self.q = q
+        self.registration_date = None
         self.buffer = ""
-        self.region = ""
-        self.name = ""
-        self.c = c
+        self.m = ""
+        self.region = region
+        self.name = name
+        self.slaves = slaves
         self.registered = False
         self.maxRetries = 3
         self.lastMethod = {}
+
+    def attach(self,m):
+        self.m = m
 
     def _handshake(self):
         try:
@@ -96,7 +102,7 @@ class Ioxclient(asyncore.dispatcher, threading.Thread):
                 if "method" in pdu:
                     log.debug("handle_read(): METHOD %s received" % (pdu['method']))
                     if(pdu['method'] == "REPLY"):
-                        self.method_REPLY(pdu)
+                        self.method_reply(pdu)
                     elif(pdu['method'] == "MANAGE"):
                         self.method_manage(pdu)
                     else:
@@ -134,34 +140,32 @@ class Ioxclient(asyncore.dispatcher, threading.Thread):
     def initialize(self):
         self.method_register()
 
-    def method_REPLY(self,pdu):
-        log.debug("method_REPLY() called")
+    def method_reply(self,pdu):
+        log.debug("method_reply() called")
         if "status" in pdu:
-            log.debug("method_REPLY() status = %s" % (pdu["status"]))
+            log.debug("method_reply() status = %s" % (pdu["status"]))
             if "rid" in pdu and "desc" in pdu:
                 if pdu["rid"] in self.lastMethod:
                     if pdu["status"] == "200":
-                        self.REPLY_200(pdu)
+                        self.reply_200(pdu)
                     elif pdu["status"] == "500":
-                        self.REPLY_500(pdu)
+                        self.reply_500(pdu)
                     else:
-                        log.debug("method_REPLY() UNKNOWN status attribute %s" % pdu["status"])
+                        log.debug("method_reply() UNKNOWN status attribute %s" % pdu["status"])
                 else:
-                    log.debug("method_REPLY() Rid %s unknown. Discarding." % (pdu["rid"]))
+                    log.debug("method_reply() Rid %s unknown. Discarding." % (pdu["rid"]))
             else:
-                log.debug("method_REPLY() Rid or desc attribute not specified")
+                log.debug("method_reply() Rid or desc attribute not specified")
         else:
-            log.debug("method_REPLY() Status attribute not specified")
+            log.debug("method_reply() Status attribute not specified")
 
     def method_manage(self,pdu):
         log.debug("method_manage() called")
         if('operation' in pdu):
-            if(pdu['operation'] == "set_treshold"):
+            if(pdu['operation'] == "set"):
                 self.operation_set_threshold(pdu)
-            elif(pdu['operation'] == "set_alert"):
-                self.operation_set_alert(pdu)
-            elif(pdu['operation'] == "query"):
-                self.operation_query(pdu)
+            elif(pdu['operation'] == "details"):
+                self.operation_details(pdu)
             else:
                 log.info("method_manage: Operation attribute invalid")
                 self.status_500("Operation attribute invalid")
@@ -169,41 +173,65 @@ class Ioxclient(asyncore.dispatcher, threading.Thread):
             log.debug("method_manage() operation attribute not specified")
             self.status_500("Operation attribute not specified")
 
-    def REPLY_500(self,pdu):
-        log.debug("REPLY_500() called")
-        log.debug("REPLY_500() Status %s desc %s for rid %s (%s)" % \
+    def reply_500(self,pdu):
+        log.debug("reply_500() called")
+        log.debug("reply_500() Status %s desc %s for rid %s (%s)" % \
                   (pdu["status"],pdu["desc"],pdu["rid"], self.lastMethod[pdu["rid"]]))
         if self.lastMethod[pdu["rid"]] == "REGISTER":
             log.debug("reply_500() retrying registration afrer 1s sleep")
             time.sleep(1)
             self.method_register()
 
-    def REPLY_200(self,pdu):
-        log.debug("REPLY_200() called")
-        log.debug("REPLY_200() Status %s desc %s for rid %s (%s)" % \
+    def reply_200(self,pdu):
+        log.debug("reply_200() called")
+        log.debug("reply_200() Status %s desc %s for rid %s (%s)" % \
                   (pdu["status"],pdu["desc"],pdu["rid"], self.lastMethod[pdu["rid"]]))
         if self.lastMethod[pdu["rid"]] == "REGISTER":
-            log.debug("REPLY_200() registration successful")
+            self.registration_date = datetime.datetime.today().__str__()
+            log.debug("reply_200() registration successful")
             self.registered = True
+
+    def operation_set(self,pdu):
+        log.debug("operation_set() called")
+        (status,desc) = (False,None)
+        if "alert" in pdu['params']:
+            (status,desc) = self.operation_set_alert(pdu)
+            if status == "500":
+                self.status_500(desc,pdu["rid"])
+        if "tresholds" in pdu['params']:
+            (status,desc) = self.operation_set_threshold(pdu)
 
     def operation_set_threshold(self,pdu):
         log.debug("operation_set_threshold() called")
         log.debug("operation_set_threshold() RID %s" % (pdu["rid"]) )
-        self.q.put(pdu)
+        self.q["one"].put(pdu)
         self.status_200("New thresholds accepted by iox",pdu["rid"] )
 
     def operation_set_alert(self,pdu):
         log.debug("operation_set_alert() called")
         allowed_alert_inputs = ["temp", "humidity", "voltage", "rpm"]
-        if pdu['params'] in allowed_alert_inputs:
-            self.q.put(pdu)
-            self.status_200("New alert settings accepted by iox",pdu["rid"])
+        if pdu['params']['alert'] in allowed_alert_inputs:
+            self.q["one"].put(pdu)
+            return ("200", "New alert settings accepted by iox")
+            #self.status_200("New alert settings accepted by iox",pdu["rid"])
         else:
-            log.debug("operation_set_alert: %s is unknown alert input" % pdu['params'])
-            self.status_500("Unknown alert input",pdu["rid"])
+            log.debug("operation_set_alert: %s is unknown alert input" % pdu['params']['alert'])
+            return ("500", "Unknown alert input")
+            #self.status_500("Unknown alert input",pdu["rid"])
 
-    def operation_query(self,pdu):
-        log.debug("operation_query() called")
+    def operation_details(self,pdu):
+        log.debug("operation_details() called")
+        (ip, port) = self.socket.getsockname()
+        pdu = {"method":"REPLY","rid":pdu["rid"], "name":self.name, \
+               "region":self.region, "date":self.registration_date, \
+               "port":port, "ip": ip, \
+               "data": {"measurements":self.m.current, \
+                        "slaves": self.m.get_slaves(),
+                        "alert": self.m.get_alert(),
+                        "thresholds": self.m.get_thresholds()} \
+               }
+        jasoned_pdu = json.dumps(pdu)
+        self.send(jasoned_pdu)
 
     def method_register(self):
         if not self.registered and self.maxRetries > 0:
@@ -213,7 +241,7 @@ class Ioxclient(asyncore.dispatcher, threading.Thread):
             packet["name"] = self.get_name()
             packet["secret"] = self.secret
             packet["region"] = self.get_region()
-            packet["c"] = self.c
+            packet["slaves"] = self.slaves
             packet["rid"] = str(uuid.uuid4().hex)
             jasoned_packet = json.dumps(packet)
             self.send(jasoned_packet)
@@ -240,7 +268,7 @@ class Ioxclient(asyncore.dispatcher, threading.Thread):
     def get_snmp(self):
         log.debug("%s called" % (self.whoami()))
         self.name = "phony-rtr"
-        self.region = "intercity premium gdansk"
+        self.region = "phony region"
 
     def client_forever(self):
         asyncore.loop()
@@ -255,10 +283,10 @@ class Ioxclient(asyncore.dispatcher, threading.Thread):
         return inspect.stack()[1][3]
 
     def status_200(self, desc="OK",rid=""):
-        self.send('{"method":"REPLY", "status": "200", "rid": "'+rid+'", "desc": "' + desc + '"}\n')
+        self.send('{"method":"reply", "status": "200", "rid": "'+rid+'", "desc": "' + desc + '"}\n')
 
     def status_500(self, desc="ERROR",rid=""):
-        self.send('{"method":"REPLY", "status": "200", "rid": "'+rid+'", "desc": "' + desc + '"}\n')
+        self.send('{"method":"reply", "status": "200", "rid": "'+rid+'", "desc": "' + desc + '"}\n')
 
     def method_unknown(self,pdu):
         log.debug("method_unknown: called")
