@@ -6,6 +6,11 @@ import select
 import socket
 import sqlite3
 import ssl
+import uuid
+
+import requests
+from alerta.alert import Alert
+from alerta.api import ApiClient
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
@@ -72,7 +77,8 @@ class EchoHandler(asyncore.dispatcher):
         self.out_buffer = ""
         self.my_buffer = ""
         self.is_writable = False
-        self.name = ""
+        self.name = None
+        self.region = None
         asyncore.dispatcher.__init__(self,self.conn_sock)
         log.debug("created handler; waiting for loop")
 
@@ -82,7 +88,7 @@ class EchoHandler(asyncore.dispatcher):
     def writable(self):
         if(self.established):
             if len(self.my_buffer) > 0:
-                log.debug("writable() mam do wyslannia %d B" % (len(self.my_buffer)))
+                #log.debug("writable() mam do wyslannia %d B" % (len(self.my_buffer)))
                 return True
             else:
                 return False
@@ -90,40 +96,53 @@ class EchoHandler(asyncore.dispatcher):
             return False
 
     def handle_write(self):
-        log.debug("handle_write(): called")
+        #log.debug("handle_write(): called")
         sent = self.send(self.my_buffer)
-        log.debug("handle_write(): %d B has been sent" % (sent))
+        #log.debug("handle_write(): %d B has been sent" % (sent))
         self.my_buffer = self.my_buffer[sent:]
 
     def handle_read(self):
-        log.debug("handle_read() called")
+#        log.debug("handle_read() called")
         data = self.recv(8192).strip()
-        log.debug('%s from %s' % (data, self.addr))
-        try:
-            pdu = json.loads(data)
-            if(pdu['method'] == "REGISTER"):
-                self.method_register(pdu)
-            elif(pdu['method'] == "DEREGISTER"):
-                self.method_deregister(pdu)
-            elif(pdu['method'] == "QUERY"):
-                self.method_query(pdu)
-            elif(pdu['method'] == "MANAGE"):
-                self.method_manage(pdu)
-            elif(pdu['method'] == "REPLY"):
-                self.method_reply(pdu)
-            elif(pdu['method'] == "QUERY"):
-                self.method_query(pdu)
-            elif(pdu["method"] == "ALERT"):
-                self.method_alert(pdu)
-            else:
-                log.debug("handle_read(): Invalid method")
-        except ValueError:
-            log.debug("handle_read(): Decoding JSON failed.")
+        if len(data) > 0:
+    #        log.debug('%s from %s' % (data, self.addr))
+            try:
+                pdu = json.loads(data)
+                if(pdu['method'] == "REGISTER"):
+                    self.method_register(pdu)
+                elif(pdu['method'] == "DEREGISTER"):
+                    self.method_deregister(pdu)
+                elif(pdu['method'] == "QUERY"):
+                    self.method_query(pdu)
+                elif(pdu['method'] == "MANAGE"):
+                    self.method_manage(pdu)
+                elif(pdu['method'] == "REPLY"):
+                    self.method_reply(pdu)
+                elif(pdu['method'] == "QUERY"):
+                    self.method_query(pdu)
+                elif(pdu["method"] == "ALERT"):
+                    self.method_alert(pdu)
+                elif(pdu["method"] == "HEARTBEAT"):
+                    # log.debug("handle_read(): heartbeat received")
+                    pass
+                else:
+                    log.debug("handle_read(): Invalid method")
+            except ValueError as e:
+                log.debug("handle_read(): Decoding JSON failed [%s]" % (data))
+        else:
+            #log.debug('ioxregd.py:handle_read() No data to read')
+            pass
 
     def handle_close(self):
         log.debug("handle_close() called")
+        if not self.name == None:
+            del self.server.registered_clients[self.name]
+            self.c.execute("DELETE FROM devices WHERE ip = ? AND port = ?",(self.client_addr[0],self.client_addr[1]))
+            self.log_alerta(event="Ioxclient disconnected " + self.name ,\
+                    region=self.region,\
+                    severity="informational",\
+                    name=self.name)
         log.info("conn_closed: client_address=%s:%s" % (self.client_addr[0], self.client_addr[1]))
-        self.c.execute("DELETE FROM devices WHERE ip = ? AND port = ?",(self.client_addr[0],self.client_addr[1]))
         self.close()
 
     def method_reply(self,pdu):
@@ -137,6 +156,7 @@ class EchoHandler(asyncore.dispatcher):
         log.debug("method_register: called")
         self.currentRid = pdu['rid']
         self.name = pdu['name']
+        self.region = pdu['region']
         try:
             self.c.execute("SELECT * FROM devices WHERE name = ?",[self.name])
         except sqlite3.Error as e:
@@ -161,6 +181,10 @@ class EchoHandler(asyncore.dispatcher):
 
                     self.server.registered_clients[pdu['name']] = self
                     log.debug("method_register: client registered successfuly")
+                    self.log_alerta(event="New ioxclient registred " + pdu['name'] ,\
+                                    region=pdu["region"],\
+                                    severity="informational",\
+                                    name=pdu["name"])
                     self.status_200()
                 else:
                     log.info("method_register: Secret mismatch")
@@ -169,11 +193,27 @@ class EchoHandler(asyncore.dispatcher):
                 log.info("method_register: Missing attributes")
                 self.status_500("Missing attributes")
 
+    def log_alerta(self,event="",region="",severity="",name=""):
+        try:
+            self.server.alerta.send( Alert(
+            resource="ioxregd",
+            event=event,
+            group=region,
+            environment='Production',
+            service=["iox"],
+            value=name,
+            severity=severity,
+            text="",
+            tags=['ioxregd', 'registration']
+            ))
+        except requests.exceptions.ConnectionError as e:
+            pass
 
     def method_deregister(self,pdu):
         log.debug("method_deregister: called")
         self.c.execute("DELETE FROM devices WHERE ip = ? AND port = ?",(self.client_addr[0],self.client_addr[1]))
         self.status_200()
+        self.close()
 
     def method_alert(self,pdu):
         log.debug("method_alert(): called")
@@ -184,13 +224,13 @@ class EchoHandler(asyncore.dispatcher):
             if row:
                 alert = {"name": pdu["name"], "type":pdu["type"], \
                          "severity": pdu["severity"], "desc":pdu["desc"], \
-                         "src": pdu["src"],"date": pdu["date"]}
+                         "slave": pdu["slave"],"date": pdu["date"]}
                 self.server.alerts.append(alert)
                 log.debug("method_alert(): alert received")
                 log.debug("method_alert(): current alerts count is %d" %(len(self.server.alerts)))
                 self.status_200("OK")
             else:
-                log.debug("method_alert(): alert received for unregistred ioxclient %s" % (pdu["name"]))
+                log.debug("method_alert(): alert received from unregistered ioxclient %s" % (pdu["name"]))
                 self.status_500("Not registred")
         else:
             log.debug("method_alert(): missing attributes")
@@ -301,11 +341,16 @@ class EchoHandler(asyncore.dispatcher):
             self.operation_set_alert(pdu)
         if "tresholds" in pdu['params']:
             self.operation_set_threshold(pdu)
+        if "notification" in pdu['params']:
+            self.operation_set_notification(pdu)
         self.operation_set_send(pdu)
+
+    def operation_set_notification(self,pdu):
+        log.debug("ioxregd.py:operation_set_notification() called")
 
     def operation_set_alert(self,pdu):
         log.debug("operation_set_alert: called")
-        allowed_alert_inputs = ["temp", "humidity", "voltage", "rpm"]
+        allowed_alert_inputs = ["temperature", "humidity", "voltage", "rpm"]
         stm = "UPDATE devices SET alert = ? WHERE name = ?"
         bind_values = []
         if pdu['params']['alert'] in allowed_alert_inputs:
@@ -319,7 +364,7 @@ class EchoHandler(asyncore.dispatcher):
 
     def operation_set_threshold(self,pdu):
         log.debug("operation_set_threshold: called")
-        allowed_attribs = ["temp","humidity","voltage","rpm","interval"]
+        allowed_attribs = ["temperature","humidity","voltage","rpm","interval"]
         allowed_tresholds = ["low", "high"]
         stm = "UPDATE devices SET "
         set_stm = ""
@@ -360,9 +405,11 @@ class EchoHandler(asyncore.dispatcher):
         if "name" in pdu:
             packet = {"method":"MANAGE","operation":"details","rid":pdu["rid"]}
             jasoned_pdu = json.dumps(packet)+"\n"
-            self.server.registered_clients[pdu["name"]].send(jasoned_pdu)
-            log.debug("operation_details(): request send to %s" % (pdu["name"]))
-            #self.status_200()
+            if pdu["name"] in self.server.registered_clients:
+                self.server.registered_clients[pdu["name"]].send(jasoned_pdu)
+                log.debug("operation_details(): request send to %s" % (pdu["name"]))
+            else:
+                self.status_500("Client %s not registered" % (pdu["name"]))
         else:
             log.debug("operation_details(): missing name attribute")
             self.status_500("Missing name attribute")
@@ -382,6 +429,8 @@ class Ioxregd(asyncore.dispatcher):
 
     def __init__(self, host, port, username, password, secret):
         asyncore.dispatcher.__init__(self)
+        self.alerta_key = None
+        self.alerta = ApiClient(endpoint="http://archangel-02.brama.waw.pl:8080")
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
         self.set_reuse_addr()
         self.bind((host, port))
@@ -409,7 +458,22 @@ class Ioxregd(asyncore.dispatcher):
             self.remote_clients.append(EchoHandler(self.c,conn_sock,client_addr,self))
 
     def server_forever(self):
-        asyncore.loop()
+        heartbeat_counter = 0;
+        while asyncore.socket_map:
+            asyncore.loop(timeout=1, count=1)
+            heartbeat_counter += 1
+            if(heartbeat_counter>5):
+                self.method_heartbeat()
+                heartbeat_counter = 0
+
+    def method_heartbeat(self):
+        #log.debug("method_heartbeat(): called")
+        for name in self.registered_clients:
+            pdu = {"method":"HEARTBEAT",
+                   "rid":str(uuid.uuid4().hex),
+                   "name": name
+                   }
+            self.registered_clients[name].send(json.dumps(pdu))
 
     def database(self):
         self.conn = sqlite3.connect('./ioxregd.db',isolation_level=None)
@@ -418,7 +482,7 @@ class Ioxregd(asyncore.dispatcher):
             self.c.execute("DROP TABLE IF EXISTS devices")
             self.c.execute("CREATE TABLE devices (ip text, port text, name text, region text, date text, \
                 m1 text, m2 text, m3 text, m4 text, \
-                temp_high_treshold default '%s', temp_low_treshold default '%s', \
+                temperature_high_treshold default '%s', temperature_low_treshold default '%s', \
                 humidity_high_treshold default '%s', humidity_low_treshold default '%s', \
                 voltage_high_treshold default '%s', voltage_low_treshold default '%s', \
                 rpm_high_treshold default '%s', rpm_low_treshold default '%s', \
